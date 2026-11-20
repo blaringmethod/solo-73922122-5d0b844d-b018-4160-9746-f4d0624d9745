@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from contextlib import asynccontextmanager
 from datetime import date
@@ -20,8 +22,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import merkle
+from . import merkle, sharding
 from .config import settings
+from .csv_records import CsvFormatError, parse_csv
 from .db import ConflictError, Database
 from .schemas import (
     AppendProofOut,
@@ -29,8 +32,12 @@ from .schemas import (
     HealthOut,
     InclusionProofOut,
     LeafRecordOut,
+    ManifestCreateIn,
+    ManifestOut,
     PublishResult,
     ReleaseOut,
+    ShardFetchOut,
+    ShardOut,
 )
 from .storage import BlobError, BlobStore
 
@@ -289,6 +296,231 @@ async def append_proof(old_seq: int):
 
 
 # --------------------------------------------------------------------------- #
+# 分片清单
+# --------------------------------------------------------------------------- #
+def _manifest_to_out(row: dict, reused: bool) -> ManifestOut:
+    shards = [
+        ShardOut(
+            shard_no=s["shard_no"],
+            release_id=s["release_id"],
+            record_range=(s["record_lo"], s["record_hi"]),
+            record_count=s["record_count"],
+            byte_range=(s["byte_start"], s["byte_end"]),
+            header_range=(s["header_start"], s["header_end"]),
+            payload_sha256=s["payload_sha256"],
+            payload_size=s["payload_size"],
+        )
+        for s in row["shards"]
+    ]
+    return ManifestOut(
+        manifest_id=row["id"],
+        request_key=row["request_key"],
+        reused=reused,
+        checkpoint_seq=row["checkpoint_seq"],
+        max_records_per_shard=row["max_records_per_shard"],
+        release_ids=json.loads(row["release_ids_json"]),
+        shard_count=row["shard_count"],
+        shards=shards,
+        created_at=row["created_at"],
+    )
+
+
+def _create_manifest_sync(payload: ManifestCreateIn) -> ManifestOut:
+    """制单主流程（线程池执行，阻塞 IO 不卡事件循环）。
+
+    全部校验通过后才在单事务内提交清单；任一步失败均抛 HTTPException，
+    数据库与清单表不产生任何写入（整份新清单不生效）。
+    """
+    release_ids = list(payload.release_ids)
+    # 去重校验：同一发布序号在一份清单内只能出现一次。
+    if len(set(release_ids)) != len(release_ids):
+        raise HTTPException(422, "release_ids 存在重复发布序号")
+    if len(release_ids) > settings.max_manifest_releases:
+        raise HTTPException(
+            422,
+            f"单份清单至多包含 {settings.max_manifest_releases} 个发布序号",
+        )
+
+    # 幂等指纹与顺序无关：同请求不同排列仍命中同一清单。
+    request_key = sharding.canonical_request_key(
+        payload.checkpoint_seq, release_ids, payload.max_records_per_shard
+    )
+    existing = database.get_manifest_by_request_key(request_key)
+    if existing is not None:
+        return _manifest_to_out(existing, reused=True)
+
+    checkpoint = database.get_checkpoint(payload.checkpoint_seq)
+    if checkpoint is None:
+        raise HTTPException(
+            422, f"不存在序号为 {payload.checkpoint_seq} 的检查点"
+        )
+
+    plan_inputs: list[sharding.ReleasePlanInput] = []
+    raw_by_digest: dict[str, bytes] = {}
+    for release_id in sorted(set(release_ids)):
+        # 检查点 seq 即截至该点的发布条数；发布序号必须落在该检查点范围内。
+        if not 1 <= release_id <= payload.checkpoint_seq:
+            raise HTTPException(
+                422,
+                f"发布序号 {release_id} 不在检查点 {payload.checkpoint_seq} "
+                f"的覆盖范围 1..{payload.checkpoint_seq} 内",
+            )
+        record = database.get_release_by_id(release_id)
+        if record is None:
+            # 序号稠密不变量下理论不可达，仍显式拒绝。
+            raise HTTPException(422, f"发布序号 {release_id} 不存在")
+        digest = record["blob_sha256"]
+        # 原件缺失或摘要不符：整单拒绝，不进入写事务。
+        if not blob_store.verify_present(digest):
+            raise HTTPException(
+                409,
+                f"发布 {release_id} 的原件缺失或摘要不符，整份清单不生效",
+            )
+        raw = blob_store.read(digest)
+        if len(raw) != record["size"]:
+            raise HTTPException(
+                409,
+                f"发布 {release_id} 的原件字节数与目录记录不符，整份清单不生效",
+            )
+        # 格式无效（编码、引用、缺表头等）：整单拒绝。
+        try:
+            layout = parse_csv(raw)
+        except CsvFormatError as exc:
+            raise HTTPException(
+                422,
+                f"发布 {release_id} 不是有效的带表头 UTF-8 CSV：{exc}",
+            ) from exc
+        raw_by_digest[digest] = raw
+        plan_inputs.append(
+            sharding.ReleasePlanInput(
+                release_id=release_id,
+                blob_sha256=digest,
+                size=record["size"],
+                layout=layout,
+            )
+        )
+
+    # 纯函数划片：每条数据记录恰好一片，片号全局稠密。
+    plans = sharding.build_shard_plans(
+        plan_inputs, payload.max_records_per_shard
+    )
+    # 按真实字节复算每片载荷摘要，并做整文件连续覆盖自检。
+    plans = sharding.finalize_shard_hashes(plans, raw_by_digest)
+
+    saved, reused = database.insert_manifest(
+        request_key=request_key,
+        checkpoint_seq=payload.checkpoint_seq,
+        max_records_per_shard=payload.max_records_per_shard,
+        release_ids=sorted(set(release_ids)),
+        shard_plans=plans,
+    )
+    return _manifest_to_out(saved, reused=reused)
+
+
+@app.post(
+    "/manifests",
+    response_model=ManifestOut,
+    status_code=201,
+    summary="提交分片清单（检查点序号 + 至多 8 个发布序号 + 每片记录数上限）",
+)
+async def create_manifest(payload: ManifestCreateIn):
+    _require_healthy()
+    return await run_in_threadpool(_create_manifest_sync, payload)
+
+
+@app.get(
+    "/manifests",
+    response_model=list[ManifestOut],
+    summary="列出全部分片清单",
+)
+async def list_manifests():
+    rows = await run_in_threadpool(database.list_manifests)
+    out: list[ManifestOut] = []
+    for row in rows:
+        full = await run_in_threadpool(database.get_manifest, row["id"])
+        out.append(_manifest_to_out(full, reused=False))
+    return out
+
+
+@app.get(
+    "/manifests/{manifest_id}",
+    response_model=ManifestOut,
+    summary="按清单编号取回清单（含各片编号、发布序号、记录与字节范围）",
+)
+async def get_manifest(manifest_id: int):
+    row = await run_in_threadpool(database.get_manifest, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"不存在编号为 {manifest_id} 的分片清单")
+    return _manifest_to_out(row, reused=False)
+
+
+@app.get(
+    "/manifests/{manifest_id}/shards/{shard_no}",
+    summary="按片号取回：仅读表头与该片字节，原样返回，摘要不符即拒绝",
+)
+async def fetch_shard(manifest_id: int, shard_no: int):
+    manifest = await run_in_threadpool(database.get_manifest, manifest_id)
+    if manifest is None:
+        raise HTTPException(404, f"不存在编号为 {manifest_id} 的分片清单")
+    shard = await run_in_threadpool(
+        database.get_shard, manifest_id, shard_no
+    )
+    if shard is None:
+        raise HTTPException(
+            404,
+            f"清单 {manifest_id} 中不存在片号 {shard_no}"
+            f"（合法范围 1..{manifest['shard_count']}）",
+        )
+
+    def _read_and_verify() -> bytes:
+        # 只读取原件表头与该片所需字节，绝不全量加载整个原件。
+        try:
+            header_bytes = blob_store.read_range(
+                shard["blob_sha256"], shard["header_start"], shard["header_end"]
+            )
+            segment = blob_store.read_range(
+                shard["blob_sha256"], shard["byte_start"], shard["byte_end"]
+            )
+        except BlobError as exc:
+            raise HTTPException(409, f"取片被拒绝：{exc}") from exc
+        payload = sharding.assemble_shard_payload(header_bytes, segment)
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        # 字节读不全或与制单时不符就拒绝，绝不返回损坏数据。
+        if actual_digest != shard["payload_sha256"]:
+            raise HTTPException(
+                409,
+                "取片被拒绝：该片载荷摘要与制单时不符，原件数据段可能已损坏",
+            )
+        if len(payload) != shard["payload_size"]:
+            raise HTTPException(
+                409, "取片被拒绝：载荷字节数与制单时不符"
+            )
+        return payload
+
+    payload = await run_in_threadpool(_read_and_verify)
+    fetch_meta = ShardFetchOut(
+        manifest_id=manifest_id,
+        shard_no=shard_no,
+        release_id=shard["release_id"],
+        record_range=(shard["record_lo"], shard["record_hi"]),
+        byte_range=(shard["byte_start"], shard["byte_end"]),
+        payload_sha256=shard["payload_sha256"],
+        payload_size=shard["payload_size"],
+    )
+    # 原样字节通过 X-Shard-Meta 头附带核验元数据，响应体即“表头+该片数据段”。
+    return Response(
+        content=payload,
+        media_type="text/csv",
+        headers={
+            "X-Shard-Meta": json.dumps(
+                fetch_meta.model_dump(), separators=(",", ":")
+            ),
+            "X-Payload-SHA256": shard["payload_sha256"],
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 健康检查
 # --------------------------------------------------------------------------- #
 @app.get("/health", response_model=HealthOut, summary="存储自检与健康状态")
@@ -311,5 +543,6 @@ def root():
             "max_file_bytes": settings.max_file_bytes,
             "max_releases": settings.max_releases,
             "tree_depth": settings.tree_depth,
+            "max_manifest_releases": settings.max_manifest_releases,
         },
     }

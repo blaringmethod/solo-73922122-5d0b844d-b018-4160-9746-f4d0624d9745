@@ -235,6 +235,99 @@ def main() -> int:
             )
             ok, _ = verify_release_bytes(proof12, b"after\n")
             check(ok, "新实例追加记录的纳入证明可在另一实例离线核验")
+
+            # 6) 分片清单跨实例：含引号内换行的多行 CSV，验证跨行记录不被切断。
+            multiline = (
+                b"station,time,ph,note\n"
+                b'ST00,2026-11-16T08:00,7.2,"line1\nline2"\n'
+                b"ST00,2026-11-16T09:00,7.0,plain\n"
+                b"ST00,2026-11-16T10:00,6.8,third\n"
+            )
+            # ST00/ORD-00 已在步骤 2 发布（内容 row-0），这里用新单号发布多行原件。
+            sm, mpub = post_release(
+                PORT_A, "STM", "2026-11-16", "ORD-MULTILINE", multiline
+            )
+            check(sm == 201, f"跨行 CSV 发布成功（实际 {sm}）")
+            ml_id = mpub["release"]["id"]
+            cp_seq = get_json(PORT_A, "/checkpoints/latest")[1]["seq"]
+
+            req = {
+                "checkpoint_seq": cp_seq,
+                "release_ids": [ml_id],
+                "max_records_per_shard": 2,
+            }
+            req_body = json.dumps(req).encode()
+            conn = http.client.HTTPConnection("127.0.0.1", PORT_A, timeout=10)
+            conn.request(
+                "POST",
+                "/manifests",
+                body=req_body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            manifest_a = json.loads(resp.read().decode())
+            conn.close()
+            check(resp.status == 201, f"实例 A 制单成功（实际 {resp.status}）")
+            # 3 条数据、每片至多 2 条 -> 2 片。
+            check(
+                manifest_a["shard_count"] == 2,
+                f"3 条记录按上限 2 切成 2 片（实际 {manifest_a['shard_count']}）",
+            )
+
+            # 同请求在实例 B 重试：必须返回原清单（reused=true，编号一致）。
+            conn = http.client.HTTPConnection("127.0.0.1", PORT_B, timeout=10)
+            conn.request(
+                "POST",
+                "/manifests",
+                body=req_body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            manifest_b = json.loads(resp.read().decode())
+            conn.close()
+            check(
+                resp.status == 201
+                and manifest_b["reused"] is True
+                and manifest_b["manifest_id"] == manifest_a["manifest_id"],
+                "同请求跨实例重试返回原清单（reused=true，编号不变）",
+            )
+            check(
+                manifest_b["shards"] == manifest_a["shards"],
+                "跨实例看到的片号、记录范围、字节范围完全一致",
+            )
+
+            # 在实例 C（重启视角）按片取回，仅读表头+该片字节，跨行记录完整。
+            mid = manifest_a["manifest_id"]
+            status_s1, shard1 = get_bytes(
+                PORT_C, f"/manifests/{mid}/shards/1"
+            )
+            status_s2, shard2 = get_bytes(
+                PORT_C, f"/manifests/{mid}/shards/2"
+            )
+            check(
+                status_s1 == 200 and status_s2 == 200,
+                "两片均在第三实例取回成功（故障转移后片号仍有效）",
+            )
+            check(
+                b'"line1\nline2"' in shard1,
+                "引号内换行的跨行记录作为完整记录保留在同一片",
+            )
+            # 两片各自带表头，去掉重复表头后数据段拼回 == 原件。
+            hdr_end = multiline.index(b"\n")
+            header = multiline[:hdr_end]
+            seg1 = shard1.split(b"\n", 1)[1]
+            seg2 = shard2.split(b"\n", 1)[1]
+            check(
+                header + b"\n" + seg1 + seg2 == multiline,
+                "两片数据段拼回与原件逐字节一致（每条记录恰好分入一片）",
+            )
+            # 片号越界返回 404。
+            conn = http.client.HTTPConnection("127.0.0.1", PORT_C, timeout=10)
+            conn.request("GET", f"/manifests/{mid}/shards/99")
+            bad_resp = conn.getresponse()
+            bad_resp.read()
+            conn.close()
+            check(bad_resp.status == 404, "越界片号返回 404")
         finally:
             # 无法 kill：改为脱离进程（它绑定临时目录，会话结束后随环境回收）。
             print(f"[note] 环境禁止 kill 信号，第三实例保留运行，端口 {PORT_C}")

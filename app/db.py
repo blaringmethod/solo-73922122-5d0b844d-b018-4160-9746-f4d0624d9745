@@ -41,6 +41,35 @@ CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- 分片清单：制单成功即冻结，只增不改。request_key 为请求指纹，保证幂等重试。
+CREATE TABLE IF NOT EXISTS manifests (
+    id                      INTEGER PRIMARY KEY,   -- 清单编号，1 起稠密
+    request_key             TEXT NOT NULL UNIQUE,
+    checkpoint_seq          INTEGER NOT NULL,
+    max_records_per_shard   INTEGER NOT NULL,
+    release_ids_json        TEXT NOT NULL,         -- 规范化排序后的发布序号
+    shard_count             INTEGER NOT NULL,
+    created_at              TEXT NOT NULL
+);
+
+-- 清单内各片：片号在清单内稠密，字节区间与载荷摘要在制单时固定。
+CREATE TABLE IF NOT EXISTS manifest_shards (
+    manifest_id      INTEGER NOT NULL,
+    shard_no         INTEGER NOT NULL,
+    release_id       INTEGER NOT NULL,
+    blob_sha256      TEXT NOT NULL,
+    record_lo        INTEGER NOT NULL,
+    record_hi        INTEGER NOT NULL,
+    byte_start       INTEGER NOT NULL,
+    byte_end         INTEGER NOT NULL,
+    header_start     INTEGER NOT NULL,
+    header_end       INTEGER NOT NULL,
+    record_count     INTEGER NOT NULL,
+    payload_sha256   TEXT NOT NULL,
+    payload_size     INTEGER NOT NULL,
+    PRIMARY KEY (manifest_id, shard_no)
+);
 """
 
 
@@ -258,6 +287,137 @@ class Database:
             return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
+    # 分片清单
+    # ------------------------------------------------------------------ #
+    def get_manifest_by_request_key(self, request_key: str):
+        """幂等查重：同请求指纹返回既有清单（含全部片），否则 None。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM manifests WHERE request_key = ?", (request_key,)
+            ).fetchone()
+            if row is None:
+                return None
+            manifest = dict(row)
+            manifest["shards"] = self._shards_locked(conn, manifest["id"])
+            return manifest
+
+    def get_manifest(self, manifest_id: int):
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM manifests WHERE id = ?", (manifest_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            manifest = dict(row)
+            manifest["shards"] = self._shards_locked(conn, manifest_id)
+            return manifest
+
+    def list_manifests(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, request_key, checkpoint_seq, max_records_per_shard, "
+                "release_ids_json, shard_count, created_at "
+                "FROM manifests ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    @staticmethod
+    def _shards_locked(conn: sqlite3.Connection, manifest_id: int) -> list[dict]:
+        rows = conn.execute(
+            "SELECT * FROM manifest_shards WHERE manifest_id = ? ORDER BY shard_no",
+            (manifest_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_shard(self, manifest_id: int, shard_no: int):
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM manifest_shards WHERE manifest_id = ? AND shard_no = ?",
+                (manifest_id, shard_no),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def insert_manifest(
+        self,
+        request_key: str,
+        checkpoint_seq: int,
+        max_records_per_shard: int,
+        release_ids: list[int],
+        shard_plans,
+    ) -> tuple[dict, bool]:
+        """原子提交整份清单及其分片。
+
+        调用方必须已完成全部原件存在性、摘要与 CSV 格式校验；
+        本方法在单个 BEGIN IMMEDIATE 事务内写入，失败整体回滚，不留半成品。
+        并发同指纹请求靠 request_key 唯一约束串行化，后到者复用先提交的清单。
+        返回 (清单, 是否复用了并发中已先提交的同指纹清单)。
+        """
+        import json as _json
+
+        for attempt in range(3):
+            try:
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        existing = conn.execute(
+                            "SELECT id FROM manifests WHERE request_key = ?",
+                            (request_key,),
+                        ).fetchone()
+                        if existing is not None:
+                            conn.rollback()
+                            return self.get_manifest(existing["id"]), True
+                        cursor = conn.execute(
+                            "INSERT INTO manifests(request_key, checkpoint_seq, "
+                            "max_records_per_shard, release_ids_json, shard_count, "
+                            "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                request_key,
+                                checkpoint_seq,
+                                max_records_per_shard,
+                                _json.dumps(release_ids, separators=(",", ":")),
+                                len(shard_plans),
+                                _utcnow(),
+                            ),
+                        )
+                        manifest_id = cursor.lastrowid
+                        conn.executemany(
+                            "INSERT INTO manifest_shards(manifest_id, shard_no, "
+                            "release_id, blob_sha256, record_lo, record_hi, "
+                            "byte_start, byte_end, header_start, header_end, "
+                            "record_count, payload_sha256, payload_size) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                (
+                                    manifest_id,
+                                    p.shard_no,
+                                    p.release_id,
+                                    p.blob_sha256,
+                                    p.record_lo,
+                                    p.record_hi,
+                                    p.byte_start,
+                                    p.byte_end,
+                                    p.header_start,
+                                    p.header_end,
+                                    p.record_count,
+                                    p.payload_sha256,
+                                    p.payload_size,
+                                )
+                                for p in shard_plans
+                            ],
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                return self.get_manifest(manifest_id), False
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    # ------------------------------------------------------------------ #
     # 启动自检：不得带着缺件记录对外服务
     # ------------------------------------------------------------------ #
     def integrity_problems(self, blob_verifier) -> list[str]:
@@ -287,4 +447,32 @@ class Database:
             latest = cp_rows[-1]
             if latest["seq"] != len(leaves) or latest["root_hex"] != root.hex():
                 problems.append("最新检查点与实际叶子集合不一致")
+            # 分片清单自检：片号稠密、每片引用的发布与摘要存在且可核验。
+            manifests = conn.execute(
+                "SELECT id, shard_count FROM manifests ORDER BY id"
+            ).fetchall()
+            expected_mid = 1
+            for mf in manifests:
+                if mf["id"] != expected_mid:
+                    problems.append(
+                        f"manifests 编号不稠密：期望 {expected_mid}，实际 {mf['id']}"
+                    )
+                expected_mid += 1
+                shard_rows = conn.execute(
+                    "SELECT shard_no, release_id, blob_sha256, payload_sha256 "
+                    "FROM manifest_shards WHERE manifest_id = ? ORDER BY shard_no",
+                    (mf["id"],),
+                ).fetchall()
+                if [s["shard_no"] for s in shard_rows] != list(
+                    range(1, mf["shard_count"] + 1)
+                ):
+                    problems.append(
+                        f"manifest {mf['id']} 片号不稠密或片数不一致"
+                    )
+                for s in shard_rows:
+                    if not blob_verifier(s["blob_sha256"]):
+                        problems.append(
+                            f"manifest {mf['id']} 片 {s['shard_no']} 的源原件"
+                            "缺失或摘要不符"
+                        )
         return problems

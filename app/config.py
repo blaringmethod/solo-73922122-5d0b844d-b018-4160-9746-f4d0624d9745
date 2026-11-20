@@ -30,6 +30,8 @@ class Settings:
     max_releases: int
     # 固定深度完整二叉树：深度 7 -> 128 个叶子槽位，与累计上限一致。
     tree_depth: int
+    # 单份分片清单最多包含的发布序号个数（需求固定为 8）。
+    max_manifest_releases: int = 8
 
     @property
     def tree_capacity(self) -> int:

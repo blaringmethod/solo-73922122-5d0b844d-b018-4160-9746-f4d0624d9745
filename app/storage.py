@@ -59,6 +59,37 @@ class BlobStore:
     def read(self, digest: str) -> bytes:
         return self._target_path(self._settings.blob_dir, digest).read_bytes()
 
+    def read_range(self, digest: str, start: int, end: int) -> bytes:
+        """读取原件半开字节区间 [start, end)。
+
+        专门服务按片取回：调用方只读取表头与该片所需字节，不全量加载原件。
+        读不到文件或实际读得字节数与请求长度不一致时抛出 :class:`BlobError`，
+        由上层拒绝本次取片（绝不返回不完整数据）。
+        """
+        if start < 0 or end < start:
+            raise BlobError(f"非法字节区间 [{start}, {end})")
+        path = self._target_path(self._settings.blob_dir, digest)
+        if not path.is_file():
+            raise BlobError(f"原件缺失: {digest[:12]}...")
+        wanted = end - start
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                chunk = handle.read(wanted)
+        except OSError as exc:
+            raise BlobError(f"原件字节读取失败: {exc}") from exc
+        if len(chunk) != wanted:
+            raise BlobError(
+                f"原件字节读不全：期望 {wanted} 字节，实际 {len(chunk)} 字节"
+            )
+        return chunk
+
+    def file_size(self, digest: str) -> int:
+        path = self._target_path(self._settings.blob_dir, digest)
+        if not path.is_file():
+            raise BlobError(f"原件缺失: {digest[:12]}...")
+        return path.stat().st_size
+
     @staticmethod
     def _fsync_dir(path: Path) -> None:
         try:
